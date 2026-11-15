@@ -7,6 +7,16 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
 ---
+## [1.3.85] - 2026-11-15
+
+### 变更
+
+- **同步上游 v1.3.84**：带来 MiniMax Code 平台、Codex 供应商配额窗口（5 小时/每周/每月）、WorkBuddy 与 CodeBuddy CN 的账号×模型探测矩阵、TraeWork 更名、供应商预设（UberLLM/Runcrate/MiniMax-M3.1-Flash）以及 18 语言文案翻新。
+
+### 修复
+
+- **同步后恢复 fork 独有功能**：上游代码树已不再携带 Qoder OAuth 模块（登录/切号）、WorkBuddy AI 平台和 fork 的更新器签名校验脚本——本次全部恢复并在 v1.3.84 基础上重新接线，保留 v1.3.83 的 bigmodel 修复以及 fork 专属的更新器端点与签名密钥。
+
 ## [1.3.83] - 2026-11-15
 
 ### 修复

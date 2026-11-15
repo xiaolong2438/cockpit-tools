@@ -7,6 +7,16 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [1.3.85] - 2026-11-15
+
+### Changed
+
+- **Synced with upstream v1.3.84**: brings in the MiniMax Code platform, Codex provider quota windows (5-hour/weekly/monthly), account-by-model probe matrices for WorkBuddy and CodeBuddy CN, TraeWork naming updates, provider presets (UberLLM/Runcrate/MiniMax-M3.1-Flash), and an 18-language locale overhaul.
+
+### Fixed
+
+- **Fork-only features re-integrated after the sync**: upstream's tree no longer carries the Qoder OAuth module (login/switching), the WorkBuddy AI platform, or the fork's updater signature verification scripts — all are restored and re-registered on top of v1.3.84, keeping the bigmodel profile fix from v1.3.83 and the fork's own updater endpoints and signing key.
+
 ## [1.3.83] - 2026-11-15
 
 ### Fixed
