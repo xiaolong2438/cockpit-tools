@@ -659,14 +659,76 @@ pub async fn import_from_local() -> Result<Vec<ZcodeAccount>, String> {
 }
 
 fn official_user_info(account: &ZcodeAccount) -> Value {
-    account.user_info_raw.clone().unwrap_or_else(|| {
-        json!({
-            "user_id": account.user_id,
-            "email": account.email,
-            "name": account.display_name,
-            "avatar": account.avatar_url,
-        })
-    })
+    // ZCode oauthService 的 parseStoredUserProfile 只认两种形状：
+    // 归一化后的 {id, username, displayName}，或原始 zhipu 系 profile
+    // 且字段必须是 user_id/name/email/avatar（见官方 GLe
+    // toOAuthUserProfileFromRawZaiUser：三者全空即返回 null，
+    // 客户端报 "missing cached user profile" 并判为未登录）。
+    // zai 与 bigmodel 的原始 profile 字段名不同（bigmodel 是
+    // customerNumber/customerName，且可能没有 email），透传会导致
+    // bigmodel 账号永远无法恢复会话，这里统一归一化输出。
+    let raw = account.user_info_raw.as_ref();
+    let string_from = |keys: &[&str]| -> Option<String> {
+        let source = raw?;
+        for key in keys {
+            if let Some(value) = source.get(*key) {
+                match value {
+                    Value::String(text) => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                    Value::Number(number) => {
+                        return Some(number.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    };
+    let user_id = string_from(&["user_id", "uid", "customerNumber", "id"])
+        .or_else(|| account.user_id.clone())
+        .unwrap_or_default();
+    let name = string_from(&["name", "customerName", "nickname", "displayName"])
+        .or_else(|| account.display_name.clone())
+        .unwrap_or_default();
+    let email = string_from(&["email", "mail"]).unwrap_or_default();
+    let avatar = string_from(&["avatar", "avatarUrl", "avatar_url"]).unwrap_or_default();
+
+    // ZCode 对 bigmodel 走独立适配器（非 GLe 分支）：存储形状必须是
+    // {id, username, displayName, avatarUrl?}，其中 id=customerNumber，
+    // displayName=customerName||nickName||"user"（见官方 resolveBigModelDisplayName）。
+    if account.provider == "bigmodel" {
+        let display_name = if name.is_empty() { "user".to_string() } else { name };
+        let mut normalized = json!({
+            "id": user_id,
+            "username": display_name,
+            "displayName": display_name,
+        });
+        if !avatar.is_empty() {
+            normalized["avatarUrl"] = Value::String(avatar);
+        }
+        if let Some(raw) = raw.filter(|value| value.is_object()) {
+            normalized["rawProfile"] = raw.clone();
+        }
+        return normalized;
+    }
+
+    let mut normalized = json!({
+        "user_id": user_id,
+        "name": name,
+        "email": email,
+        "avatar": avatar,
+    });
+    // 保留原始 profile：ZCode 的 parseStoredUserProfile 会把它挂回
+    // profile.rawProfile，客户端内依赖原始字段（如 customerNumber）的
+    // 逻辑不受影响。
+    if let Some(raw) = raw.filter(|value| value.is_object()) {
+        normalized["rawProfile"] = raw.clone();
+    }
+    normalized
 }
 
 fn ensure_object<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
@@ -1329,6 +1391,72 @@ mod tests {
             decrypt_credential(&encrypted, home).unwrap(),
             "secret-value"
         );
+    }
+
+    #[test]
+    fn normalizes_zai_user_info_for_official_parser() {
+        let account = sample_account();
+        let info = official_user_info(&account);
+        assert_eq!(info["user_id"], "fixture-user");
+        assert_eq!(info["name"], "Fixture User");
+        assert_eq!(info["email"], "fixture@example.com");
+        assert_eq!(info["avatar"], "https://example.com/avatar.png");
+    }
+
+    #[test]
+    fn normalizes_bigmodel_user_info_fields_for_official_parser() {
+        // bigmodel 开放平台 profile 用 customerName/customerNumber，且 email/avatar
+        // 可能为 null；ZCode 的 GLe 解析器只认 user_id/name/email/avatar，且三者
+        // 全空即视为 missing cached user profile。必须归一化输出。
+        let mut account = sample_account();
+        account.provider = "bigmodel".to_string();
+        account.email = "unknown@zcode.local".to_string();
+        account.display_name = Some("ogxfo215".to_string());
+        account.user_id = Some("20171718893127367".to_string());
+        account.user_info_raw = Some(json!({
+            "id": 574843,
+            "customerNumber": "20171718893127367",
+            "customerName": "ogxfo215",
+            "email": null,
+            "avatar": null,
+            "acState": "AC_SUCCESS",
+        }));
+
+        let info = official_user_info(&account);
+        // bigmodel 必须存官方适配器的形状 A：{id, username, displayName}，
+        // id=customerNumber，displayName=customerName||nickName||"user"。
+        assert_eq!(info["id"], "20171718893127367");
+        assert_eq!(info["username"], "ogxfo215");
+        assert_eq!(info["displayName"], "ogxfo215");
+        assert!(info.get("avatarUrl").is_none());
+        assert_eq!(info["rawProfile"]["customerName"], "ogxfo215");
+    }
+
+    #[test]
+    fn bigmodel_user_info_defaults_display_name_to_user() {
+        let mut account = sample_account();
+        account.provider = "bigmodel".to_string();
+        account.display_name = None;
+        account.user_info_raw = Some(json!({
+            "customerNumber": "42",
+            "customerName": "",
+            "nickName": null,
+        }));
+        let info = official_user_info(&account);
+        assert_eq!(info["id"], "42");
+        assert_eq!(info["username"], "user");
+        assert_eq!(info["displayName"], "user");
+    }
+
+    #[test]
+    fn falls_back_to_account_identity_when_raw_profile_is_empty() {
+        let mut account = sample_account();
+        account.user_info_raw = None;
+        let info = official_user_info(&account);
+        assert_eq!(info["user_id"], "fixture-user");
+        assert_eq!(info["name"], "Fixture User");
+        assert_eq!(info["email"], "fixture@example.com");
+        assert_eq!(info["avatar"], "https://example.com/avatar.png");
     }
 
     #[test]

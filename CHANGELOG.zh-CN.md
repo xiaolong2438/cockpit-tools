@@ -7,6 +7,12 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
 ---
+## [1.3.83] - 2026-11-15
+
+### 修复
+
+- **ZCode bigmodel 账号切换**：注入的 bigmodel 凭据现在按 ZCode 官方 bigmodel 适配器的存储形状写入（`{id, username, displayName}`，其中 `id` 为 customerNumber），不再使用 zai 用户的字段名。此前 ZCode 会把注入的 profile 判为「missing cached user profile」，每次切到 bigmodel 账号后客户端都显示未登录。zai 账号保持客户端期望的原始 zai-user 形状不变。
+
 ## [1.3.82] - 2026-11-08
 
 ### 修复

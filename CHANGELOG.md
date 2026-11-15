@@ -7,6 +7,12 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [1.3.83] - 2026-11-15
+
+### Fixed
+
+- **ZCode bigmodel account switching**: injected bigmodel credentials now store the user profile in the exact shape ZCode's own bigmodel adapter writes (`{id, username, displayName}` where `id` is the customerNumber), instead of the zai-user field names. Previously ZCode rejected the injected profile as "missing cached user profile" and the client showed signed-out after every bigmodel switch. Zai profiles keep the raw zai-user shape the client expects.
+
 ## [1.3.82] - 2026-11-08
 
 ### Fixed
