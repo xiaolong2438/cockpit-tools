@@ -5,16 +5,10 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      publish:
-        description: "Publish to GitHub Releases (false creates validation artifacts only)"
-        required: false
-        type: boolean
-        default: false
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && inputs.publish != true }}
+  cancel-in-progress: false
 
 jobs:
   prepare-release:
@@ -24,26 +18,11 @@ jobs:
       contents: write
     outputs:
       version: ${{ steps.app_version.outputs.VERSION }}
-      publish: ${{ steps.publish_mode.outputs.PUBLISH }}
     env:
       GH_REPO: ${{ github.repository }}
     steps:
-      - name: 🧭 Determine publication mode
-        id: publish_mode
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ "${{ inputs.publish }}" = "true" ]; then
-              echo "PUBLISH=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "PUBLISH=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "PUBLISH=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: 🔍 Validate release ref
-        if: ${{ steps.publish_mode.outputs.PUBLISH == 'true' && !startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         shell: bash
         run: |
           echo "Release runs must target a v* tag; received ${GITHUB_REF}."
@@ -57,6 +36,19 @@ jobs:
         with:
           node-version: 22
 
+      - name: Validate updater signing configuration
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            echo "::error::Missing TAURI_SIGNING_PRIVATE_KEY repository secret. Configure updater signing before releasing."
+            exit 1
+          fi
+          node -e 'const c = require("./src-tauri/tauri.conf.json"); const u = c.plugins.updater; const base = "https://github.com/" + process.env.GITHUB_REPOSITORY + "/releases/"; if (!u.pubkey || !c.bundle.createUpdaterArtifacts || !u.endpoints.length || !u.endpoints.every(url => url.startsWith(base))) { throw new Error("Updater key, artifacts or repository endpoints are misconfigured"); } console.log("Updater public configuration matches this repository");'
+
       - name: 📖 Read app version
         id: app_version
         shell: bash
@@ -66,7 +58,6 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: 🔍 Validate tag matches version
-        if: steps.publish_mode.outputs.PUBLISH == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -139,8 +130,47 @@ jobs:
 
           date -u +"%Y-%m-%dT%H:%M:%SZ" > published-at.txt
 
-      - name: 🚀 Create or update draft release
-        if: steps.publish_mode.outputs.PUBLISH == 'true'
+      - name: 💾 Preserve previous legacy latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREVIOUS_TAG="$(
+            gh release list \
+              --limit 100 \
+              --json tagName,isDraft,isPrerelease \
+              --jq "[.[] | select(.isDraft == false and .isPrerelease == false and .tagName != \"${GITHUB_REF_NAME}\")][0].tagName // \"\""
+          )"
+
+          if [ -n "${PREVIOUS_TAG}" ]; then
+            mkdir -p previous-release
+            gh release download "${PREVIOUS_TAG}" \
+              --pattern "latest.json" \
+              --dir previous-release \
+              --clobber
+            test -s previous-release/latest.json
+            cp previous-release/latest.json legacy-latest.json
+            echo "Preserved legacy latest.json from ${PREVIOUS_TAG}"
+          else
+            # First release: platform jobs will replace this placeholder with
+            # the complete manifest after all installer assets are uploaded.
+            cat > legacy-latest.json <<'JSON'
+          {
+            "version": "0.0.0",
+            "notes": "",
+            "pub_date": "1970-01-01T00:00:00.000Z",
+            "platforms": {}
+          }
+          JSON
+            echo "No previous published release found; staging a first-release placeholder latest.json"
+          fi
+
+      # Publish the release early (with previous complete latest.json) so parallel
+      # platform jobs can verify assets via public tag download URLs without
+      # waiting for Windows, and without reading the previous release's
+      # same-named target manifests through /releases/latest/.
+      - name: 🚀 Create or update staged release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -149,14 +179,26 @@ jobs:
           TAG="v${{ steps.app_version.outputs.VERSION }}"
           TITLE="Cockpit Tools v${{ steps.app_version.outputs.VERSION }}"
           if gh release view "${TAG}" > /dev/null 2>&1; then
-            IS_DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft')"
-            if [ "${IS_DRAFT}" != "true" ]; then
-              echo "Release ${TAG} is already published; refusing to mutate a public release."
-              exit 1
-            fi
-            gh release edit "${TAG}" --title "${TITLE}" --notes-file release-notes.md
+            gh release edit "${TAG}" \
+              --title "${TITLE}" \
+              --notes-file release-notes.md
           else
-            gh release create "${TAG}" --draft --title "${TITLE}" --notes-file release-notes.md
+            gh release create "${TAG}" \
+              --draft \
+              --title "${TITLE}" \
+              --notes-file release-notes.md
+          fi
+
+          IS_DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft')"
+          if [ "${IS_DRAFT}" = "true" ]; then
+            cp legacy-latest.json latest.json
+            gh release upload "${TAG}" latest.json --clobber
+            gh release edit "${TAG}" --draft=false --prerelease=false --latest
+            echo "Published staged release ${TAG} with legacy latest.json"
+          else
+            # Re-run after a prior publish: do not clobber a finalized latest.json.
+            echo "Release ${TAG} is already published; leaving latest.json as-is"
+            gh release edit "${TAG}" --prerelease=false --latest
           fi
 
       - name: 📤 Upload release metadata artifact
@@ -168,43 +210,11 @@ jobs:
           path: |
             release-notes.md
             published-at.txt
-
-  prepare-frontend:
-    name: "🌐 Prepare production frontend"
-    needs: prepare-release
-    runs-on: ubuntu-latest
-    steps:
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
-
-      - name: ⚙️ Node.js setup
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: "npm"
-
-      - name: 📦 Install frontend dependencies
-        run: npm ci --prefer-offline --no-audit --no-fund
-
-      - name: 🔄 Sync release versions
-        run: npm run sync-version
-
-      - name: 🏗️ Build production frontend assets
-        run: npm run build
-
-      - name: 📤 Share production frontend
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-inputs-release-frontend
-          path: dist
-          retention-days: 1
-          compression-level: 0
+            legacy-latest.json
 
   build-windows:
     name: "🏗️ Build: Windows"
-    needs:
-      - prepare-release
-      - prepare-frontend
+    needs: prepare-release
     runs-on: windows-latest
     permissions:
       contents: write
@@ -218,10 +228,10 @@ jobs:
       - name: 🦀 Rust setup
         uses: dtolnay/rust-toolchain@stable
 
-      - name: 💾 Host build cache
-        uses: ./.github/actions/host-build-cache
+      - name: 🦀 Rust cache
+        uses: swatinem/rust-cache@v2
         with:
-          target: windows
+          key: windows-release
 
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
@@ -235,11 +245,13 @@ jobs:
       - name: 🔄 Sync versions
         run: npm run sync-version
 
-      - name: 📥 Reuse production frontend
-        uses: actions/download-artifact@v4
+      - name: 💾 Cache Tauri tooling
+        uses: actions/cache@v4
         with:
-          name: build-inputs-release-frontend
-          path: dist
+          path: C:\Users\runneradmin\AppData\Local\tauri
+          key: tauri-deps-windows-latest-${{ hashFiles('package-lock.json', '**/Cargo.toml') }}
+          restore-keys: |
+            tauri-deps-windows-latest-
 
       - name: 🏗️ Build Windows app
         shell: bash
@@ -247,19 +259,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          COCKPIT_PREBUILT_FRONTEND_DIST: "dist"
         run: |
-          set -euo pipefail
-          npx tauri build --ci
-
-      - name: 📦 Build Windows portable archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/build_windows_portable.cjs \
-            --version "${VERSION}" \
-            --release-dir "target/release" \
-            --output-dir "portable-assets"
+          set -uo pipefail
+          # Bundler tool downloads (WiX/NSIS/linuxdeploy) hit intermittent
+          # GitHub asset 5xx during the storage outage. Rust artifacts are
+          # incremental, so a retry re-runs only the bundling stage.
+          status=0
+          for attempt in 1 2 3 4; do
+            npx tauri build --ci
+            status=$?
+            if [ "$status" -eq 0 ]; then
+              break
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              exit "$status"
+            fi
+            echo "Build attempt $attempt failed (exit $status); retrying in 90s..."
+            sleep 90
+          done
 
       - name: 📥 Download release metadata
         uses: actions/download-artifact@v4
@@ -275,10 +292,8 @@ jobs:
             --platform windows \
             --assets-dir "target/release/bundle" \
             --output-dir "release-assets"
-          cp portable-assets/* release-assets/
 
       - name: 📤 Upload Windows release assets
-        if: needs.prepare-release.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -288,13 +303,13 @@ jobs:
           shopt -s nullglob
           ASSETS=(release-assets/*)
           test "${#ASSETS[@]}" -gt 0
-          node scripts/release/upload_release_assets.cjs "${TAG}" "${ASSETS[@]}"
+          node scripts/release/verify_updater_signatures.cjs --assets-dir release-assets --config src-tauri/tauri.conf.json
+          gh release upload "${TAG}" "${ASSETS[@]}" --clobber
           echo "Uploaded ${#ASSETS[@]} Windows assets"
 
       - name: 📤 Build and upload Windows updater manifests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_PUBLISH: ${{ needs.prepare-release.outputs.publish }}
         shell: bash
         run: |
           set -euo pipefail
@@ -306,55 +321,45 @@ jobs:
             --published-at "$(cat release-metadata/published-at.txt)" \
             --targets "windows-x86_64-msi,windows-x86_64-nsis" \
             --output-dir "target-manifests"
-          if [ "${RELEASE_PUBLISH}" = "true" ]; then
-            node scripts/release/upload_release_assets.cjs "v${VERSION}" target-manifests/*.json
+          gh release upload "v${VERSION}" target-manifests/*.json --clobber
+
+      # Fallback only: prepare should already have published with legacy latest.json.
+      - name: 🚀 Ensure staged release is published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          IS_DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft')"
+          if [ "${IS_DRAFT}" = "true" ]; then
+            cp release-metadata/legacy-latest.json latest.json
+            gh release upload "${TAG}" latest.json --clobber
+            gh release edit "${TAG}" --draft=false --prerelease=false --latest
+            echo "Published staged release from Windows fallback with legacy latest.json"
+          else
+            echo "Release is already published; keeping its current latest.json"
           fi
 
-      - name: 📦 Upload Windows validation artifacts
-        if: needs.prepare-release.outputs.publish != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-windows
-          retention-days: 7
-          if-no-files-found: error
-          path: |
-            release-assets
-            target-manifests
-
-      - name: 🧾 Publish Windows package summary
-        if: always()
+      # Mid-stage verify uses the tag download URL so parallel jobs do not race
+      # on /releases/latest/ before this release is marked latest (or before
+      # other platforms finish). Public /latest/ is checked in finalize.
+      - name: 🔍 Verify published Windows updater manifests
         shell: bash
-        env:
-          JOB_STATUS: ${{ job.status }}
         run: |
-          shopt -s nullglob
-          assets=(release-assets/*)
-          {
-            echo "### 🪟 Windows packages"
-            echo
-            echo "**Mode:** ${{ needs.prepare-release.outputs.publish == 'true' && 'GitHub Release' || 'Validation artifact' }}"
-            echo
-            if [ "${#assets[@]}" -gt 0 ]; then
-              for asset in "${assets[@]}"; do
-                printf -- '- `%s`\n' "$(basename "$asset")"
-              done
-            else
-              echo "❌ No staged release packages were produced."
-            fi
-            if [ "$JOB_STATUS" != "success" ]; then
-              echo
-              echo "❌ The Windows release job did not complete successfully."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          node scripts/release/verify_published_updater_manifests.cjs \
+            --version "${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --targets "windows-x86_64-msi,windows-x86_64-nsis" \
+            --latest-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
 
   build-macos-aarch64:
     name: "🏗️ Build: macOS Apple Silicon"
     # Parallel with Windows / macOS Intel after prepare (no hard platform deps).
     needs:
       - prepare-release
-      - prepare-frontend
     runs-on: macos-latest
-    timeout-minutes: 120
     permissions:
       contents: write
     env:
@@ -369,10 +374,10 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - name: 💾 Host build cache
-        uses: ./.github/actions/host-build-cache
+      - name: 🦀 Rust cache
+        uses: swatinem/rust-cache@v2
         with:
-          target: macos-aarch64
+          key: macos-aarch64-release
 
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
@@ -386,21 +391,13 @@ jobs:
       - name: 🔄 Sync versions
         run: npm run sync-version
 
-      - name: 📥 Reuse production frontend
-        uses: actions/download-artifact@v4
+      - name: 💾 Cache Tauri tooling
+        uses: actions/cache@v4
         with:
-          name: build-inputs-release-frontend
-          path: dist
-
-      - name: 🔐 Prepare Apple signing and notarization
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: node scripts/release/macos-signing.cjs prepare
+          path: ~/Library/Caches/tauri
+          key: tauri-deps-macos-latest-aarch64-${{ hashFiles('package-lock.json', '**/Cargo.toml') }}
+          restore-keys: |
+            tauri-deps-macos-latest-aarch64-
 
       - name: 🏗️ Build macOS Apple Silicon app
         shell: bash
@@ -408,45 +405,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          COCKPIT_PREBUILT_FRONTEND_DIST: "dist"
         run: |
           set -euo pipefail
-          node scripts/tauri.cjs build --ci --target aarch64-apple-darwin
-
-      - name: 📦 Prepare Universal binary inputs
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/macos-universal.cjs --mode stage \
-            --target aarch64-apple-darwin --version "${VERSION}" \
-            --output "universal-inputs/aarch64-apple-darwin"
-
-      - name: 📤 Share Universal binary inputs
-        uses: actions/upload-artifact@v4
-        with:
-          name: universal-inputs-aarch64
-          path: universal-inputs/aarch64-apple-darwin
-          overwrite: true
-          retention-days: 1
-          compression-level: 1
-          if-no-files-found: error
-
-      - name: 📝 Rebuild DMG with installation instructions
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/inject-dmg-readme.cjs \
-            --bundle-dir "target/aarch64-apple-darwin/release/bundle"
-
-      - name: ✅ Notarize final DMG and verify macOS assets
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: node scripts/release/macos-signing.cjs finalize "target/aarch64-apple-darwin/release/bundle"
+          npx tauri build --ci --target aarch64-apple-darwin
 
       - name: 📥 Download release metadata
         uses: actions/download-artifact@v4
@@ -465,7 +426,6 @@ jobs:
             --output-dir "release-assets"
 
       - name: 📤 Upload macOS Apple Silicon assets
-        if: needs.prepare-release.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -475,13 +435,13 @@ jobs:
           shopt -s nullglob
           ASSETS=(release-assets/*)
           test "${#ASSETS[@]}" -gt 0
-          node scripts/release/upload_release_assets.cjs "${TAG}" "${ASSETS[@]}"
+          node scripts/release/verify_updater_signatures.cjs --assets-dir release-assets --config src-tauri/tauri.conf.json
+          gh release upload "${TAG}" "${ASSETS[@]}" --clobber
           echo "Uploaded ${#ASSETS[@]} macOS Apple Silicon assets"
 
       - name: 📤 Build and upload macOS Apple Silicon updater manifest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_PUBLISH: ${{ needs.prepare-release.outputs.publish }}
         shell: bash
         run: |
           set -euo pipefail
@@ -493,59 +453,25 @@ jobs:
             --published-at "$(cat release-metadata/published-at.txt)" \
             --targets "darwin-aarch64-app" \
             --output-dir "target-manifests"
-          if [ "${RELEASE_PUBLISH}" = "true" ]; then
-            node scripts/release/upload_release_assets.cjs "v${VERSION}" target-manifests/*.json
-          fi
+          gh release upload "v${VERSION}" target-manifests/*.json --clobber
 
-      - name: 📦 Upload macOS Apple Silicon validation artifacts
-        if: needs.prepare-release.outputs.publish != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-macos-aarch64
-          retention-days: 7
-          if-no-files-found: error
-          path: |
-            release-assets
-            target-manifests
-
-      - name: 🧾 Publish macOS Apple Silicon package summary
-        if: always()
+      # Tag URL (not /releases/latest/) — see Windows verify comment.
+      - name: 🔍 Verify published macOS Apple Silicon updater manifest
         shell: bash
-        env:
-          JOB_STATUS: ${{ job.status }}
         run: |
-          shopt -s nullglob
-          assets=(release-assets/*)
-          {
-            echo "### 🍎 macOS Apple Silicon packages"
-            echo
-            echo "**Mode:** ${{ needs.prepare-release.outputs.publish == 'true' && 'GitHub Release' || 'Validation artifact' }}"
-            echo
-            if [ "${#assets[@]}" -gt 0 ]; then
-              for asset in "${assets[@]}"; do
-                printf -- '- `%s`\n' "$(basename "$asset")"
-              done
-            else
-              echo "❌ No staged release packages were produced."
-            fi
-            if [ "$JOB_STATUS" != "success" ]; then
-              echo
-              echo "❌ The macOS Apple Silicon release job did not complete successfully."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 🧹 Remove temporary Apple signing keychain
-        if: always()
-        run: node scripts/release/macos-signing.cjs cleanup
+          set -euo pipefail
+          node scripts/release/verify_published_updater_manifests.cjs \
+            --version "${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --targets "darwin-aarch64-app" \
+            --latest-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
 
   build-macos-x86_64:
     name: "🏗️ Build: macOS Intel"
     # Parallel with Windows / macOS Apple Silicon after prepare.
     needs:
       - prepare-release
-      - prepare-frontend
     runs-on: macos-latest
-    timeout-minutes: 120
     permissions:
       contents: write
     env:
@@ -560,10 +486,10 @@ jobs:
         with:
           targets: x86_64-apple-darwin
 
-      - name: 💾 Host build cache
-        uses: ./.github/actions/host-build-cache
+      - name: 🦀 Rust cache
+        uses: swatinem/rust-cache@v2
         with:
-          target: macos-x86_64
+          key: macos-x86_64-release
 
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
@@ -577,21 +503,13 @@ jobs:
       - name: 🔄 Sync versions
         run: npm run sync-version
 
-      - name: 📥 Reuse production frontend
-        uses: actions/download-artifact@v4
+      - name: 💾 Cache Tauri tooling
+        uses: actions/cache@v4
         with:
-          name: build-inputs-release-frontend
-          path: dist
-
-      - name: 🔐 Prepare Apple signing and notarization
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: node scripts/release/macos-signing.cjs prepare
+          path: ~/Library/Caches/tauri
+          key: tauri-deps-macos-latest-x86_64-${{ hashFiles('package-lock.json', '**/Cargo.toml') }}
+          restore-keys: |
+            tauri-deps-macos-latest-x86_64-
 
       - name: 🏗️ Build macOS Intel app
         shell: bash
@@ -599,45 +517,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          COCKPIT_PREBUILT_FRONTEND_DIST: "dist"
         run: |
           set -euo pipefail
-          node scripts/tauri.cjs build --ci --target x86_64-apple-darwin
-
-      - name: 📦 Prepare Universal binary inputs
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/macos-universal.cjs --mode stage \
-            --target x86_64-apple-darwin --version "${VERSION}" \
-            --output "universal-inputs/x86_64-apple-darwin"
-
-      - name: 📤 Share Universal binary inputs
-        uses: actions/upload-artifact@v4
-        with:
-          name: universal-inputs-x86_64
-          path: universal-inputs/x86_64-apple-darwin
-          overwrite: true
-          retention-days: 1
-          compression-level: 1
-          if-no-files-found: error
-
-      - name: 📝 Rebuild DMG with installation instructions
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/inject-dmg-readme.cjs \
-            --bundle-dir "target/x86_64-apple-darwin/release/bundle"
-
-      - name: ✅ Notarize final DMG and verify macOS assets
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: node scripts/release/macos-signing.cjs finalize "target/x86_64-apple-darwin/release/bundle"
+          npx tauri build --ci --target x86_64-apple-darwin
 
       - name: 📥 Download release metadata
         uses: actions/download-artifact@v4
@@ -656,7 +538,6 @@ jobs:
             --output-dir "release-assets"
 
       - name: 📤 Upload macOS Intel assets
-        if: needs.prepare-release.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -666,13 +547,13 @@ jobs:
           shopt -s nullglob
           ASSETS=(release-assets/*)
           test "${#ASSETS[@]}" -gt 0
-          node scripts/release/upload_release_assets.cjs "${TAG}" "${ASSETS[@]}"
+          node scripts/release/verify_updater_signatures.cjs --assets-dir release-assets --config src-tauri/tauri.conf.json
+          gh release upload "${TAG}" "${ASSETS[@]}" --clobber
           echo "Uploaded ${#ASSETS[@]} macOS Intel assets"
 
       - name: 📤 Build and upload macOS Intel updater manifest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_PUBLISH: ${{ needs.prepare-release.outputs.publish }}
         shell: bash
         run: |
           set -euo pipefail
@@ -684,60 +565,26 @@ jobs:
             --published-at "$(cat release-metadata/published-at.txt)" \
             --targets "darwin-x86_64-app" \
             --output-dir "target-manifests"
-          if [ "${RELEASE_PUBLISH}" = "true" ]; then
-            node scripts/release/upload_release_assets.cjs "v${VERSION}" target-manifests/*.json
-          fi
+          gh release upload "v${VERSION}" target-manifests/*.json --clobber
 
-      - name: 📦 Upload macOS Intel validation artifacts
-        if: needs.prepare-release.outputs.publish != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-macos-x86_64
-          retention-days: 7
-          if-no-files-found: error
-          path: |
-            release-assets
-            target-manifests
-
-      - name: 🧾 Publish macOS Intel package summary
-        if: always()
+      # Tag URL (not /releases/latest/) — see Windows verify comment.
+      - name: 🔍 Verify published macOS Intel updater manifest
         shell: bash
-        env:
-          JOB_STATUS: ${{ job.status }}
         run: |
-          shopt -s nullglob
-          assets=(release-assets/*)
-          {
-            echo "### 🍎 macOS Intel packages"
-            echo
-            echo "**Mode:** ${{ needs.prepare-release.outputs.publish == 'true' && 'GitHub Release' || 'Validation artifact' }}"
-            echo
-            if [ "${#assets[@]}" -gt 0 ]; then
-              for asset in "${assets[@]}"; do
-                printf -- '- `%s`\n' "$(basename "$asset")"
-              done
-            else
-              echo "❌ No staged release packages were produced."
-            fi
-            if [ "$JOB_STATUS" != "success" ]; then
-              echo
-              echo "❌ The macOS Intel release job did not complete successfully."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 🧹 Remove temporary Apple signing keychain
-        if: always()
-        run: node scripts/release/macos-signing.cjs cleanup
+          set -euo pipefail
+          node scripts/release/verify_published_updater_manifests.cjs \
+            --version "${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --targets "darwin-x86_64-app" \
+            --latest-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
 
   build-macos-universal:
     name: "🏗️ Build: macOS Universal"
-    # Reuse exact binaries from this run. Universal only merges and bundles.
+    # This is an independent source build; run it in parallel with the two
+    # architecture-specific jobs instead of waiting for their release assets.
     needs:
       - prepare-release
-      - build-macos-aarch64
-      - build-macos-x86_64
     runs-on: macos-latest
-    timeout-minutes: 120
     permissions:
       contents: write
     env:
@@ -752,6 +599,11 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      - name: 🦀 Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: macos-universal-release
+
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
         with:
@@ -764,61 +616,23 @@ jobs:
       - name: 🔄 Sync versions
         run: npm run sync-version
 
-      - name: 📥 Download ARM binary inputs
-        uses: actions/download-artifact@v4
+      - name: 💾 Cache Tauri tooling
+        uses: actions/cache@v4
         with:
-          name: universal-inputs-aarch64
-          path: universal-inputs/aarch64-apple-darwin
+          path: ~/Library/Caches/tauri
+          key: tauri-deps-macos-latest-universal-${{ hashFiles('package-lock.json', '**/Cargo.toml') }}
+          restore-keys: |
+            tauri-deps-macos-latest-universal-
 
-      - name: 📥 Download Intel binary inputs
-        uses: actions/download-artifact@v4
-        with:
-          name: universal-inputs-x86_64
-          path: universal-inputs/x86_64-apple-darwin
-
-      - name: 🔗 Verify and merge Universal binaries
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/macos-universal.cjs --mode merge \
-            --inputs universal-inputs --version "${VERSION}"
-
-      - name: 🔐 Prepare Apple signing and notarization
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: node scripts/release/macos-signing.cjs prepare
-
-      - name: 📦 Bundle macOS Universal app
+      - name: 🏗️ Build macOS Universal app
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          node scripts/tauri.cjs bundle --ci --target universal-apple-darwin
-
-      - name: 📝 Rebuild DMG with installation instructions
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/inject-dmg-readme.cjs \
-            --bundle-dir "target/universal-apple-darwin/release/bundle"
-
-      - name: ✅ Notarize final DMG and verify macOS assets
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: node scripts/release/macos-signing.cjs finalize "target/universal-apple-darwin/release/bundle"
+          npx tauri build --ci --target universal-apple-darwin
 
       - name: 📦 Stage macOS Universal assets
         shell: bash
@@ -831,7 +645,6 @@ jobs:
             --output-dir "release-assets"
 
       - name: 📤 Upload macOS Universal assets
-        if: needs.prepare-release.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -841,55 +654,15 @@ jobs:
           shopt -s nullglob
           ASSETS=(release-assets/*)
           test "${#ASSETS[@]}" -gt 0
-          node scripts/release/upload_release_assets.cjs "${TAG}" "${ASSETS[@]}"
+          node scripts/release/verify_updater_signatures.cjs --assets-dir release-assets --config src-tauri/tauri.conf.json
+          gh release upload "${TAG}" "${ASSETS[@]}" --clobber
           echo "Uploaded ${#ASSETS[@]} macOS Universal assets"
-
-      - name: 📦 Upload macOS Universal validation artifacts
-        if: needs.prepare-release.outputs.publish != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-macos-universal
-          retention-days: 7
-          if-no-files-found: error
-          path: |
-            release-assets
-
-      - name: 🧾 Publish macOS Universal package summary
-        if: always()
-        shell: bash
-        env:
-          JOB_STATUS: ${{ job.status }}
-        run: |
-          shopt -s nullglob
-          assets=(release-assets/*)
-          {
-            echo "### 🍎 macOS Universal packages"
-            echo
-            echo "**Mode:** ${{ needs.prepare-release.outputs.publish == 'true' && 'GitHub Release' || 'Validation artifact' }}"
-            echo
-            if [ "${#assets[@]}" -gt 0 ]; then
-              for asset in "${assets[@]}"; do
-                printf -- '- `%s`\n' "$(basename "$asset")"
-              done
-            else
-              echo "❌ No staged release packages were produced."
-            fi
-            if [ "$JOB_STATUS" != "success" ]; then
-              echo
-              echo "❌ The macOS Universal release job did not complete successfully."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 🧹 Remove temporary Apple signing keychain
-        if: always()
-        run: node scripts/release/macos-signing.cjs cleanup
 
   build-linux:
     name: "🏗️ Build: Linux (${{ matrix.label }})"
     # Parallel with Windows / macOS after prepare; matrix arches run in parallel.
     needs:
       - prepare-release
-      - prepare-frontend
     runs-on: ${{ matrix.platform }}
     permissions:
       contents: write
@@ -919,10 +692,10 @@ jobs:
       - name: 🦀 Rust setup
         uses: dtolnay/rust-toolchain@stable
 
-      - name: 💾 Host build cache
-        uses: ./.github/actions/host-build-cache
+      - name: 🦀 Rust cache
+        uses: swatinem/rust-cache@v2
         with:
-          target: linux-${{ matrix.label }}
+          key: linux-${{ matrix.label }}-release
 
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
@@ -936,11 +709,13 @@ jobs:
       - name: 🔄 Sync versions
         run: npm run sync-version
 
-      - name: 📥 Reuse production frontend
-        uses: actions/download-artifact@v4
+      - name: 💾 Cache Tauri tooling
+        uses: actions/cache@v4
         with:
-          name: build-inputs-release-frontend
-          path: dist
+          path: ~/.cache/tauri
+          key: tauri-deps-${{ matrix.platform }}-${{ hashFiles('package-lock.json', '**/Cargo.toml') }}
+          restore-keys: |
+            tauri-deps-${{ matrix.platform }}-
 
       - name: 🏗️ Build Linux app
         shell: bash
@@ -948,10 +723,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          COCKPIT_PREBUILT_FRONTEND_DIST: "dist"
         run: |
-          set -euo pipefail
-          npx tauri build --ci
+          set -uo pipefail
+          # Bundler tool downloads (WiX/NSIS/linuxdeploy) hit intermittent
+          # GitHub asset 5xx during the storage outage. Rust artifacts are
+          # incremental, so a retry re-runs only the bundling stage.
+          status=0
+          for attempt in 1 2 3 4; do
+            npx tauri build --ci
+            status=$?
+            if [ "$status" -eq 0 ]; then
+              break
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              exit "$status"
+            fi
+            echo "Build attempt $attempt failed (exit $status); retrying in 90s..."
+            sleep 90
+          done
 
       - name: 📥 Download release metadata
         uses: actions/download-artifact@v4
@@ -969,7 +758,6 @@ jobs:
             --output-dir "release-assets"
 
       - name: 📤 Upload Linux assets
-        if: needs.prepare-release.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -979,13 +767,13 @@ jobs:
           shopt -s nullglob
           ASSETS=(release-assets/*)
           test "${#ASSETS[@]}" -gt 0
-          node scripts/release/upload_release_assets.cjs "${TAG}" "${ASSETS[@]}"
+          node scripts/release/verify_updater_signatures.cjs --assets-dir release-assets --config src-tauri/tauri.conf.json
+          gh release upload "${TAG}" "${ASSETS[@]}" --clobber
           echo "Uploaded ${#ASSETS[@]} Linux assets"
 
       - name: 📤 Build and upload Linux updater manifests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_PUBLISH: ${{ needs.prepare-release.outputs.publish }}
         shell: bash
         run: |
           set -euo pipefail
@@ -997,50 +785,21 @@ jobs:
             --published-at "$(cat release-metadata/published-at.txt)" \
             --targets "${{ matrix.targets }}" \
             --output-dir "target-manifests"
-          if [ "${RELEASE_PUBLISH}" = "true" ]; then
-            node scripts/release/upload_release_assets.cjs "v${VERSION}" target-manifests/*.json
-          fi
+          gh release upload "v${VERSION}" target-manifests/*.json --clobber
 
-      - name: 📦 Upload Linux validation artifacts
-        if: needs.prepare-release.outputs.publish != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-linux-${{ matrix.label }}
-          retention-days: 7
-          if-no-files-found: error
-          path: |
-            release-assets
-            target-manifests
-
-      - name: 🧾 Publish Linux package summary
-        if: always()
+      # Tag URL (not /releases/latest/) — see Windows verify comment.
+      - name: 🔍 Verify published Linux updater manifests
         shell: bash
-        env:
-          JOB_STATUS: ${{ job.status }}
         run: |
-          shopt -s nullglob
-          assets=(release-assets/*)
-          {
-            echo "### 🐧 Linux ${{ matrix.label }} packages"
-            echo
-            echo "**Mode:** ${{ needs.prepare-release.outputs.publish == 'true' && 'GitHub Release' || 'Validation artifact' }}"
-            echo
-            if [ "${#assets[@]}" -gt 0 ]; then
-              for asset in "${assets[@]}"; do
-                printf -- '- `%s`\n' "$(basename "$asset")"
-              done
-            else
-              echo "❌ No staged release packages were produced."
-            fi
-            if [ "$JOB_STATUS" != "success" ]; then
-              echo
-              echo "❌ The Linux release job did not complete successfully."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          node scripts/release/verify_published_updater_manifests.cjs \
+            --version "${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --targets "${{ matrix.targets }}" \
+            --latest-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
 
   finalize-legacy-latest:
     name: 🏁 Finalize Legacy Updater Manifest
-    if: needs.prepare-release.outputs.publish == 'true'
     # Wait for every platform build so latest.json is complete.
     needs:
       - prepare-release
@@ -1096,6 +855,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          node scripts/release/verify_updater_signatures.cjs --assets-dir release-assets --config src-tauri/tauri.conf.json
           node scripts/release/build_merged_latest_json.cjs \
             --version "${VERSION}" \
             --repo "${GITHUB_REPOSITORY}" \
@@ -1122,17 +882,28 @@ jobs:
           ' latest.json > /dev/null
           jq -r '.platforms | keys[]' latest.json
 
-      - name: 📤 Upload complete legacy latest.json
+      - name: 📤 Publish complete legacy latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/release/upload_release_assets.cjs "v${VERSION}" latest.json
+          gh release upload "v${VERSION}" latest.json --clobber
+          gh release edit "v${VERSION}" --draft=false --prerelease=false --latest
+
+      # End-to-end: user-facing /releases/latest/download (do not use tag URL here).
+      - name: 🔍 Verify complete published updater state
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release/verify_published_updater_manifests.cjs \
+            --version "${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --targets "darwin-aarch64-app,darwin-x86_64-app,windows-x86_64-msi,windows-x86_64-nsis,linux-x86_64-appimage,linux-x86_64-deb,linux-x86_64-rpm,linux-aarch64-appimage,linux-aarch64-deb,linux-aarch64-rpm" \
+            --legacy
 
   upload-checksums:
     name: 🔗 Publish SHA256SUMS
-    if: needs.prepare-release.outputs.publish == 'true'
     needs:
       - prepare-release
       - finalize-legacy-latest
@@ -1143,14 +914,6 @@ jobs:
       GH_REPO: ${{ github.repository }}
       VERSION: ${{ needs.prepare-release.outputs.version }}
     steps:
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
-
-      - name: ⚙️ Node.js setup
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
       - name: 📥 Download release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1183,65 +946,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/release/upload_release_assets.cjs "v${VERSION}" SHA256SUMS.txt
+          gh release upload "v${VERSION}" SHA256SUMS.txt --clobber
 
-  publish-release:
-    name: 🚀 Publish Verified Release
-    if: needs.prepare-release.outputs.publish == 'true'
+  update-homebrew-cask:
+    # Fork updater releases do not require Homebrew PR/auto-merge permissions.
+    if: ${{ github.repository == 'jlcodes99/cockpit-tools' || vars.ENABLE_HOMEBREW_RELEASE == 'true' }}
+    name: 🍺 Update Homebrew Cask
     needs:
       - prepare-release
       - finalize-legacy-latest
-      - upload-checksums
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      GH_REPO: ${{ github.repository }}
-      VERSION: ${{ needs.prepare-release.outputs.version }}
-    steps:
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
-
-      - name: ⚙️ Node.js setup
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: 🚀 Publish release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="v${VERSION}"
-          IS_DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft')"
-          if [ "${IS_DRAFT}" = "true" ]; then
-            gh release edit "${TAG}" --draft=false --prerelease=false --latest
-          elif [ "${IS_DRAFT}" = "false" ]; then
-            # Re-running this job after public verification failed must reach
-            # verification again without changing the already public release.
-            echo "Release ${TAG} is already public; continuing to verification."
-          else
-            echo "Unexpected draft state for release ${TAG}: ${IS_DRAFT}"
-            exit 1
-          fi
-
-      - name: 🔍 Verify complete published updater state
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/verify_published_updater_manifests.cjs \
-            --version "${VERSION}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --targets "darwin-aarch64-app,darwin-x86_64-app,windows-x86_64-msi,windows-x86_64-nsis,linux-x86_64-appimage,linux-x86_64-deb,linux-x86_64-rpm,linux-aarch64-appimage,linux-aarch64-deb,linux-aarch64-rpm" \
-            --legacy
-
-  update-homebrew-cask:
-    name: 🍺 Update Homebrew Cask
-    if: needs.prepare-release.outputs.publish == 'true'
-    needs:
-      - prepare-release
-      - publish-release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1339,115 +1052,3 @@ jobs:
 
           echo "Unable to enable auto-merge for cask PR ${PR_NUMBER}: state=${PR_STATE}, merge_state=${PR_MERGE_STATE}"
           exit 1
-
-  validate-release-artifacts:
-    name: "🧪 Validate packaged release"
-    if: needs.prepare-release.outputs.publish != 'true'
-    needs:
-      - prepare-release
-      - build-windows
-      - build-macos-aarch64
-      - build-macos-x86_64
-      - build-macos-universal
-      - build-linux
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      VERSION: ${{ needs.prepare-release.outputs.version }}
-    steps:
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
-
-      - name: ⚙️ Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: 📥 Download packaged release artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: validation-workspace
-          merge-multiple: true
-
-      - name: 🏗️ Build and validate complete updater manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/build_merged_latest_json.cjs \
-            --version "${VERSION}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --assets-dir "validation-workspace/release-assets" \
-            --notes-file "validation-workspace/release-notes.md" \
-            --published-at "$(cat validation-workspace/published-at.txt)" \
-            --output "latest.json"
-
-          jq -e '
-            .platforms["darwin-aarch64"] and
-            .platforms["darwin-x86_64"] and
-            .platforms["windows-x86_64"] and
-            .platforms["windows-x86_64-nsis"] and
-            .platforms["linux-x86_64-appimage"] and
-            .platforms["linux-x86_64-deb"] and
-            .platforms["linux-x86_64-rpm"] and
-            .platforms["linux-aarch64-appimage"] and
-            .platforms["linux-aarch64-deb"] and
-            .platforms["linux-aarch64-rpm"]
-          ' latest.json > /dev/null
-
-          test -n "$(find validation-workspace/release-assets -name '*_universal.dmg' -print -quit)"
-
-      - name: 🔗 Generate validation checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          (
-            cd validation-workspace/release-assets
-            find . -type f -print0 \
-              | sort -z \
-              | while IFS= read -r -d '' file; do
-                  shasum -a 256 "$file"
-                done \
-              | sed 's#  \./#  #'
-          ) > SHA256SUMS.txt
-          test -s SHA256SUMS.txt
-
-      - name: 📤 Upload complete release validation bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-validation-${{ env.VERSION }}
-          retention-days: 7
-          compression-level: 0
-          if-no-files-found: error
-          path: |
-            validation-workspace/release-assets
-            validation-workspace/target-manifests
-            latest.json
-            SHA256SUMS.txt
-
-      - name: 🧾 Publish release validation summary
-        if: always()
-        shell: bash
-        env:
-          JOB_STATUS: ${{ job.status }}
-        run: |
-          asset_count="$(find validation-workspace/release-assets -type f 2>/dev/null | wc -l | tr -d ' ')"
-          manifest_count="$(find validation-workspace/target-manifests -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
-          checksum_count="$(wc -l < SHA256SUMS.txt 2>/dev/null || printf '0')"
-          platform_count="$(jq '.platforms | length' latest.json 2>/dev/null || printf '0')"
-          {
-            echo "### 🧪 Complete release validation"
-            echo
-            echo "| Check | Result |"
-            echo "| --- | --- |"
-            echo "| Packaged assets | ${asset_count} |"
-            echo "| Target updater manifests | ${manifest_count} |"
-            echo "| Legacy updater platforms | ${platform_count} |"
-            echo "| SHA-256 entries | ${checksum_count} |"
-            if [ "$JOB_STATUS" = "success" ]; then
-              echo "| Validation bundle | ✅ Uploaded |"
-            else
-              echo "| Validation bundle | ❌ Incomplete |"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
