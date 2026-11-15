@@ -752,10 +752,9 @@ fn write_auth_value_to_configured_store(
     }
 }
 
+#[cfg(test)]
 pub fn write_auth_file_to_dir(base_dir: &Path, account: &CodexAccount) -> Result<(), String> {
-    write_auth_file_to_dir_with_after_commit(base_dir, account, || {
-        crate::modules::codex_cli_daemon::after_auth_commit(base_dir);
-    })
+    write_auth_file_to_dir_with_after_commit(base_dir, account, || {})
 }
 
 fn write_auth_file_to_dir_with_after_commit(
@@ -876,9 +875,54 @@ pub(crate) fn write_prepared_account_bundle_to_dir(
     base_dir: &Path,
     account: &CodexAccount,
 ) -> Result<(), String> {
+    write_bundle_with_cli_daemon_notice(
+        base_dir,
+        |credentials_changed| write_prepared_account_bundle(base_dir, account, credentials_changed),
+        |complete| notify_after_account_bundle_write(base_dir, account, complete),
+    )
+}
+
+fn notify_after_account_bundle_write(base_dir: &Path, account: &CodexAccount, complete: bool) {
+    if crate::modules::codex_local_access::is_local_access_runtime_account_id(&account.id) {
+        crate::modules::codex_cli_daemon::after_profile_write(base_dir, false);
+        return;
+    }
+    // The switch prepares the gateway's final model catalog after this bundle.
+    if !complete || !crate::modules::codex_local_access::account_requires_provider_gateway(account) {
+        crate::modules::codex_cli_daemon::after_profile_write(base_dir, complete);
+    }
+}
+
+fn write_bundle_with_cli_daemon_notice(
+    base_dir: &Path,
+    write: impl FnOnce(&std::cell::Cell<bool>) -> Result<(), String>,
+    notify: impl FnOnce(bool),
+) -> Result<(), String> {
+    let previous_provider = read_api_provider_from_config_toml(base_dir);
+    let previous_account = read_managed_projection_account_id_from_dir(base_dir);
+    let credentials_changed = std::cell::Cell::new(false);
+    let result = write(&credentials_changed);
+    let account_or_provider_changed = result.is_ok()
+        && (previous_provider != read_api_provider_from_config_toml(base_dir)
+            || previous_account != read_managed_projection_account_id_from_dir(base_dir));
+    if credentials_changed.get() || account_or_provider_changed {
+        notify(result.is_ok());
+    }
+    result
+}
+
+pub(crate) fn configured_provider_base_url(base_dir: &Path) -> Option<String> {
+    read_api_provider_from_config_toml(base_dir).base_url
+}
+
+fn write_prepared_account_bundle(
+    base_dir: &Path,
+    account: &CodexAccount,
+    credentials_changed: &std::cell::Cell<bool>,
+) -> Result<(), String> {
     reject_chatgpt_plan_client_injection(account)?;
     let account = resolve_account_for_bundle_write(base_dir, account)?;
-    write_auth_file_to_dir(base_dir, &account)?;
+    write_auth_file_to_dir_with_after_commit(base_dir, &account, || credentials_changed.set(true))?;
     write_managed_projection_to_dir(base_dir, &account)?;
     sync_or_cleanup_managed_model_catalog_for_dir(base_dir, &account)?;
     Ok(())
@@ -1002,26 +1046,30 @@ fn write_api_key_account_bundle_with_oauth_to_dir(
         return Ok(());
     }
 
-    write_prepared_account_bundle_to_dir(base_dir, oauth_account)?;
-    let provider_config =
-        write_api_key_provider_override_to_config_toml(base_dir, api_key_account)?;
-    // config/Provider 归 API Key 账号所有，但 auth.json/keychain 中的一次性 RT 链
-    // 归绑定的 OAuth 账号所有。必须同时持久化两种归属，否则官方客户端轮换 RT 后，
-    // OAuth 账号单独启动时可能找不到最新凭据并再次消费旧 RT。
-    write_managed_projection_with_credential_owner_to_dir(
+    write_bundle_with_cli_daemon_notice(
         base_dir,
-        api_key_account,
-        oauth_account,
-    )?;
-    sync_or_cleanup_managed_model_catalog_for_dir(base_dir, api_key_account)?;
-    logger::log_info(&format!(
-        "[Codex切号] 已写入 API Key 账号绑定 OAuth 的组合配置: api_account_id={}, oauth_account_id={}, target_dir={}, has_base_url={}",
-        api_key_account.id,
-        oauth_account.id,
-        base_dir.display(),
-        provider_config.base_url.is_some()
-    ));
-    Ok(())
+        |credentials_changed| {
+            write_prepared_account_bundle(base_dir, oauth_account, credentials_changed)?;
+            let provider_config =
+                write_api_key_provider_override_to_config_toml(base_dir, api_key_account)?;
+            // Provider 归 API Key 账号，凭据及其刷新链归绑定的 OAuth 账号。
+            write_managed_projection_with_credential_owner_to_dir(
+                base_dir,
+                api_key_account,
+                oauth_account,
+            )?;
+            sync_or_cleanup_managed_model_catalog_for_dir(base_dir, api_key_account)?;
+            logger::log_info(&format!(
+            "[Codex切号] 已写入 API Key 账号绑定 OAuth 的组合配置: api_account_id={}, oauth_account_id={}, target_dir={}, has_base_url={}",
+            api_key_account.id,
+            oauth_account.id,
+            base_dir.display(),
+            provider_config.base_url.is_some()
+            ));
+            Ok(())
+        },
+        |complete| notify_after_account_bundle_write(base_dir, api_key_account, complete),
+    )
 }
 
 pub fn write_account_bundle_to_dir(base_dir: &Path, account: &CodexAccount) -> Result<(), String> {
@@ -1473,28 +1521,19 @@ fn renderer_project_owner_from_auth(
     let access = tokens["access_token"]
         .as_str()
         .and_then(decode_jwt_payload_value);
-    let id = tokens["id_token"]
-        .as_str()
-        .and_then(decode_jwt_payload_value);
-    let user = access
+    let Some(claims) = access
         .as_ref()
-        .and_then(|v| v["https://api.openai.com/auth"]["chatgpt_user_id"].as_str())
-        .or_else(|| {
-            id.as_ref()
-                .and_then(|v| v["https://api.openai.com/auth"]["chatgpt_user_id"].as_str())
-        });
-    let account = tokens["account_id"]
+        .and_then(|value| value.get("https://api.openai.com/auth"))
+    else {
+        return Ok(None);
+    };
+    // Both desktop builds derive the renderer principal from these access-token claims.
+    let user = claims["user_id"]
         .as_str()
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            access
-                .as_ref()
-                .and_then(|v| v["https://api.openai.com/auth"]["chatgpt_account_id"].as_str())
-        })
-        .or_else(|| {
-            id.as_ref()
-                .and_then(|v| v["https://api.openai.com/auth"]["chatgpt_account_id"].as_str())
-        });
+        .or_else(|| claims["chatgpt_user_id"].as_str());
+    let account = claims["chatgpt_account_id"]
+        .as_str()
+        .or_else(|| claims["account_id"].as_str());
     Ok(match (user, account) {
         (Some(user), Some(account)) if !user.is_empty() && !account.is_empty() => {
             let identity = serde_json::to_vec(&serde_json::json!([user, account]))
@@ -1508,29 +1547,44 @@ fn renderer_project_owner_from_auth(
 #[cfg(test)]
 mod account_project_switch_identity_tests {
     use super::*;
-    fn token(user: &str, account: &str) -> String {
-        let claims = serde_json::json!({"https://api.openai.com/auth":{
-            "chatgpt_user_id":user,"chatgpt_account_id":account}});
+    fn token(identity: serde_json::Value) -> String {
+        let claims = serde_json::json!({"https://api.openai.com/auth":identity});
         format!(
             "e30.{}.sig",
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
         )
     }
     #[test]
-    fn account_project_switch_uses_projected_oauth_identity_not_key_label() {
+    fn account_project_switch_prefers_official_access_token_claims_when_fields_conflict() {
         let auth = serde_json::json!({"auth_mode":"chatgpt","tokens":{
-            "access_token":token("user-one","original-account"),
-            "account_id":"selected-workspace"
+            "access_token":token(serde_json::json!({
+                "user_id":"user-one","chatgpt_user_id":"legacy-user",
+                "chatgpt_account_id":"token-workspace","account_id":"legacy-workspace"
+            })),
+            "id_token":token(serde_json::json!({
+                "user_id":"id-token-user","chatgpt_account_id":"id-token-workspace"
+            })),
+            "account_id":"projected-workspace"
         }});
-        let expected = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&serde_json::json!(["user-one", "selected-workspace"])).unwrap()
-            )
-        );
         assert_eq!(
             renderer_project_owner_from_auth(&auth).unwrap(),
-            Some(Some(expected))
+            Some(Some(format!(
+                "{:x}",
+                Sha256::digest(br#"["user-one","token-workspace"]"#)
+            )))
+        );
+    }
+    #[test]
+    fn account_project_switch_accepts_user_id_without_chatgpt_user_id() {
+        let auth = serde_json::json!({"tokens":{
+            "access_token":token(serde_json::json!({"user_id":"user","account_id":"workspace"}))
+        }});
+        assert_eq!(
+            renderer_project_owner_from_auth(&auth).unwrap(),
+            Some(Some(format!(
+                "{:x}",
+                Sha256::digest(br#"["user","workspace"]"#)
+            )))
         );
     }
     #[test]
@@ -1549,10 +1603,13 @@ mod account_project_switch_identity_tests {
             .unwrap(),
             None
         );
-        let auth = serde_json::json!({"tokens":{"id_token":token("user","account")}});
-        assert!(renderer_project_owner_from_auth(&auth)
-            .unwrap()
-            .flatten()
-            .is_some());
+        let auth = serde_json::json!({"tokens":{
+            "access_token":token(serde_json::json!({"user_id":"user"})),
+            "id_token":token(serde_json::json!({
+                "user_id":"user","chatgpt_account_id":"workspace"
+            })),
+            "account_id":"workspace"
+        }});
+        assert_eq!(renderer_project_owner_from_auth(&auth).unwrap(), None);
     }
 }

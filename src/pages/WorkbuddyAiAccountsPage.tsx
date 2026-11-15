@@ -18,7 +18,6 @@ import {
 } from '../components/codebuddy-suite/CodebuddySuiteAccountsSharedView';
 
 const WORKBUDDY_AI_FLOW_NOTICE_COLLAPSED_KEY = 'agtools.workbuddy_ai.flow_notice_collapsed';
-const WORKBUDDY_AI_CURRENT_ACCOUNT_ID_KEY = 'agtools.workbuddy_ai.current_account_id';
 
 const workbuddyAiPlatformConfig: CodebuddySuiteAccountsPlatformConfig<WorkbuddyAccount> = {
   pageClassName: 'workbuddy-ai-accounts-page',
@@ -98,7 +97,6 @@ export function WorkbuddyAiAccountsPage() {
     platformKey: 'WorkBuddy AI',
     oauthLogPrefix: 'WorkbuddyAiOAuth',
     flowNoticeCollapsedKey: WORKBUDDY_AI_FLOW_NOTICE_COLLAPSED_KEY,
-    currentAccountIdKey: WORKBUDDY_AI_CURRENT_ACCOUNT_ID_KEY,
     exportFilePrefix: 'workbuddy_ai_accounts',
     oauthTabKeys: ['oauth'],
     store: {

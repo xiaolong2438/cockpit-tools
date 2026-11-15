@@ -1089,12 +1089,9 @@ pub fn start_workbuddy_default_with_args_with_new_window(
 ) -> Result<u32, String> {
     #[cfg(target_os = "macos")]
     {
-        let app_root = resolve_macos_app_root_from_config("workbuddy").or_else(|| {
-            resolve_workbuddy_launch_path()
-                .ok()
-                .and_then(|p| resolve_macos_app_root_from_launch_path(&p))
-        });
-        let app_root = app_root.ok_or_else(|| app_path_missing_error("workbuddy"))?;
+        let launch_path = resolve_workbuddy_launch_path()?;
+        let app_root = resolve_macos_app_root_from_launch_path(&launch_path)
+            .ok_or_else(|| app_path_missing_error("workbuddy"))?;
 
         let mut args: Vec<String> = Vec::new();
         if use_new_window {
@@ -1193,86 +1190,6 @@ pub fn start_workbuddy_default_with_args_with_new_window(
     }
 }
 
-/// 启动 WorkBuddy AI（国际版）客户端：使用设置中配置的可执行文件路径。
-pub fn start_workbuddy_ai_client() -> Result<u32, String> {
-    let configured = config::get_user_config()
-        .workbuddy_ai_app_path
-        .trim()
-        .to_string();
-    if configured.is_empty() {
-        return Err(
-            "WorkBuddy AI 启动路径未配置，请先在 设置 → 通用 中选择 WorkBuddy AI 可执行文件"
-                .to_string(),
-        );
-    }
-    let launch_path = std::path::PathBuf::from(&configured);
-    if !launch_path.is_file() {
-        return Err(format!(
-            "WorkBuddy AI 启动路径无效或文件不存在: {}",
-            launch_path.display()
-        ));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-
-        let mut cmd = Command::new(&launch_path);
-        if should_detach_child() {
-            cmd.creation_flags(0x08000000 | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-        } else {
-            cmd.creation_flags(0x08000000);
-        }
-        let child = spawn_command_with_trace(&mut cmd)
-            .map_err(|e| format!("启动 WorkBuddy AI 失败：{}", e))?;
-        crate::modules::logger::log_info(&format!(
-            "[WorkBuddy AI Start] 客户端启动命令已发送 pid={} path={}",
-            child.id(),
-            launch_path.display()
-        ));
-        return Ok(child.id());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let launch_path_str = launch_path.to_string_lossy();
-        let pid = spawn_open_app_with_options(&launch_path_str, &[], true)
-            .map_err(|e| format!("启动 WorkBuddy AI 失败：{}", e))?;
-        crate::modules::logger::log_info(&format!(
-            "[WorkBuddy AI Start] 客户端启动命令已发送 pid={} path={}",
-            pid,
-            launch_path.display()
-        ));
-        return Ok(pid);
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let mut cmd = Command::new(&launch_path);
-        if should_detach_child() {
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-        }
-        let child = spawn_detached_unix(&mut cmd)
-            .map_err(|e| format!("启动 WorkBuddy AI 失败：{}", e))?;
-        crate::modules::logger::log_info(&format!(
-            "[WorkBuddy AI Start] 客户端启动命令已发送 pid={} path={}",
-            child.id(),
-            launch_path.display()
-        ));
-        return Ok(child.id());
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        Err("WorkBuddy AI 启动仅支持 macOS、Windows 和 Linux".to_string())
-    }
-}
-
 pub fn start_qoder_with_args_with_new_window(
     user_data_dir: &str,
     extra_args: &[String],
@@ -1303,8 +1220,13 @@ pub fn start_qoder_with_args_with_new_window(
             }
         }
 
-        let open_pid = spawn_open_app_with_options(&app_root, &args, true)
-            .map_err(|e| format!("启动 Qoder 失败: {}", e))?;
+        let env = ["VSCODE_APPDATA", "VSCODE_PORTABLE"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
+            .collect::<Vec<_>>();
+        let env_pairs = env.iter().map(|(key, value)| (*key, value.as_str())).collect::<Vec<_>>();
+        let open_pid = spawn_open_app_with_options_and_env(&app_root, &args, true, &env_pairs)
+            .map_err(|e| format!("QODER_LAUNCH_FAILED: {}", e))?;
         crate::modules::logger::log_info("Qoder 启动命令已发送（open -n -a）");
         let probe_started = Instant::now();
         let timeout = Duration::from_secs(6);
@@ -1355,7 +1277,7 @@ pub fn start_qoder_with_args_with_new_window(
         }
 
         let child =
-            spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Qoder 失败: {}", e))?;
+            spawn_command_with_trace(&mut cmd).map_err(|e| format!("QODER_LAUNCH_FAILED: {}", e))?;
         crate::modules::logger::log_info("Qoder 启动命令已发送");
         return Ok(child.id());
     }
@@ -1388,7 +1310,7 @@ pub fn start_qoder_with_args_with_new_window(
             }
         }
 
-        let child = spawn_detached_unix(&mut cmd).map_err(|e| format!("启动 Qoder 失败: {}", e))?;
+        let child = spawn_detached_unix(&mut cmd).map_err(|e| format!("QODER_LAUNCH_FAILED: {}", e))?;
         crate::modules::logger::log_info("Qoder 启动命令已发送");
         return Ok(child.id());
     }
@@ -1423,8 +1345,13 @@ pub fn start_qoder_default_with_args_with_new_window(
             }
         }
 
-        let open_pid = spawn_open_app_with_options(&app_root, &args, true)
-            .map_err(|e| format!("启动 Qoder 失败: {}", e))?;
+        let env = ["VSCODE_APPDATA", "VSCODE_PORTABLE"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
+            .collect::<Vec<_>>();
+        let env_pairs = env.iter().map(|(key, value)| (*key, value.as_str())).collect::<Vec<_>>();
+        let open_pid = spawn_open_app_with_options_and_env(&app_root, &args, true, &env_pairs)
+            .map_err(|e| format!("QODER_LAUNCH_FAILED: {}", e))?;
         crate::modules::logger::log_info("Qoder 默认实例启动命令已发送（open -n -a）");
         let probe_started = Instant::now();
         let timeout = Duration::from_secs(6);
@@ -1468,7 +1395,7 @@ pub fn start_qoder_default_with_args_with_new_window(
             }
         }
         let child =
-            spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Qoder 失败: {}", e))?;
+            spawn_command_with_trace(&mut cmd).map_err(|e| format!("QODER_LAUNCH_FAILED: {}", e))?;
         crate::modules::logger::log_info("Qoder 默认实例启动命令已发送");
         return Ok(child.id());
     }
@@ -1494,7 +1421,7 @@ pub fn start_qoder_default_with_args_with_new_window(
                 cmd.arg(trimmed);
             }
         }
-        let child = spawn_detached_unix(&mut cmd).map_err(|e| format!("启动 Qoder 失败: {}", e))?;
+        let child = spawn_detached_unix(&mut cmd).map_err(|e| format!("QODER_LAUNCH_FAILED: {}", e))?;
         crate::modules::logger::log_info("Qoder 默认实例启动命令已发送");
         return Ok(child.id());
     }
@@ -1963,10 +1890,14 @@ pub fn start_trae_platform_default_with_args_with_new_window(
     }
 }
 
-pub fn start_vscode_default_with_args_with_new_window(
-    extra_args: &[String],
-    use_new_window: bool,
-) -> Result<u32, String> {
+pub fn start_vscode_default_with_args(extra_args: &[String]) -> Result<u32, String> {
+    // Window restoration belongs to VS Code's window.restoreWindows setting.
+    let args: Vec<String> = extra_args
+        .iter()
+        .map(|arg| arg.trim())
+        .filter(|arg| !arg.is_empty())
+        .map(str::to_owned)
+        .collect();
     #[cfg(target_os = "macos")]
     {
         // 使用 open -a 启动，避免 macOS Responsible Process 归因
@@ -1976,19 +1907,6 @@ pub fn start_vscode_default_with_args_with_new_window(
                 .and_then(|p| resolve_macos_app_root_from_launch_path(&p))
         });
         let app_root = app_root.ok_or_else(|| app_path_missing_error("vscode"))?;
-
-        let mut args: Vec<String> = Vec::new();
-        if use_new_window {
-            args.push("--new-window".to_string());
-        } else {
-            args.push("--reuse-window".to_string());
-        }
-        for arg in extra_args {
-            let trimmed = arg.trim();
-            if !trimmed.is_empty() {
-                args.push(trimmed.to_string());
-            }
-        }
 
         let open_pid = spawn_open_app_with_options(&app_root, &args, true)
             .map_err(|e| format!("启动 VS Code 失败: {}", e))?;
@@ -2024,17 +1942,7 @@ pub fn start_vscode_default_with_args_with_new_window(
         } else {
             cmd.creation_flags(0x08000000);
         }
-        if use_new_window {
-            cmd.arg("--new-window");
-        } else {
-            cmd.arg("--reuse-window");
-        }
-        for arg in extra_args {
-            let trimmed = arg.trim();
-            if !trimmed.is_empty() {
-                cmd.arg(trimmed);
-            }
-        }
+        cmd.args(&args);
         let child =
             spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 VS Code 失败: {}", e))?;
         crate::modules::logger::log_info("VS Code 默认实例启动命令已发送");
@@ -2051,17 +1959,7 @@ pub fn start_vscode_default_with_args_with_new_window(
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
         }
-        if use_new_window {
-            cmd.arg("--new-window");
-        } else {
-            cmd.arg("--reuse-window");
-        }
-        for arg in extra_args {
-            let trimmed = arg.trim();
-            if !trimmed.is_empty() {
-                cmd.arg(trimmed);
-            }
-        }
+        cmd.args(&args);
         let child =
             spawn_detached_unix(&mut cmd).map_err(|e| format!("启动 VS Code 失败: {}", e))?;
         crate::modules::logger::log_info("VS Code 默认实例启动命令已发送");
@@ -2070,7 +1968,7 @@ pub fn start_vscode_default_with_args_with_new_window(
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
-        let _ = (extra_args, use_new_window);
+        let _ = args;
         Err("GitHub Copilot 应用多开仅支持 macOS、Windows 和 Linux".to_string())
     }
 }
@@ -2097,6 +1995,7 @@ pub fn close_vscode(user_data_dirs: &[String], timeout_secs: u64) -> Result<(), 
         "无法关闭受管 VS Code 实例进程，请手动关闭后重试",
         user_data_dirs,
         timeout_secs,
+        close_pids,
         collect_vscode_process_entries,
         |entries, target_dirs| {
             select_main_pids_by_target_dirs(entries, target_dirs, default_dir.as_deref())
@@ -2160,3 +2059,82 @@ tell application \"System Events\" to keystroke \"q\" using command down",
     }
 }
 
+/// 启动 WorkBuddy AI（国际版）客户端：使用设置中配置的可执行文件路径。
+pub fn start_workbuddy_ai_client() -> Result<u32, String> {
+    let configured = config::get_user_config()
+        .workbuddy_ai_app_path
+        .trim()
+        .to_string();
+    if configured.is_empty() {
+        return Err(
+            "WorkBuddy AI 启动路径未配置，请先在 设置 → 通用 中选择 WorkBuddy AI 可执行文件"
+                .to_string(),
+        );
+    }
+    let launch_path = std::path::PathBuf::from(&configured);
+    if !launch_path.is_file() {
+        return Err(format!(
+            "WorkBuddy AI 启动路径无效或文件不存在: {}",
+            launch_path.display()
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let mut cmd = Command::new(&launch_path);
+        if should_detach_child() {
+            cmd.creation_flags(0x08000000 | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        } else {
+            cmd.creation_flags(0x08000000);
+        }
+        let child = spawn_command_with_trace(&mut cmd)
+            .map_err(|e| format!("启动 WorkBuddy AI 失败：{}", e))?;
+        crate::modules::logger::log_info(&format!(
+            "[WorkBuddy AI Start] 客户端启动命令已发送 pid={} path={}",
+            child.id(),
+            launch_path.display()
+        ));
+        return Ok(child.id());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let launch_path_str = launch_path.to_string_lossy();
+        let pid = spawn_open_app_with_options(&launch_path_str, &[], true)
+            .map_err(|e| format!("启动 WorkBuddy AI 失败：{}", e))?;
+        crate::modules::logger::log_info(&format!(
+            "[WorkBuddy AI Start] 客户端启动命令已发送 pid={} path={}",
+            pid,
+            launch_path.display()
+        ));
+        return Ok(pid);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = Command::new(&launch_path);
+        if should_detach_child() {
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        }
+        let child = spawn_detached_unix(&mut cmd)
+            .map_err(|e| format!("启动 WorkBuddy AI 失败：{}", e))?;
+        crate::modules::logger::log_info(&format!(
+            "[WorkBuddy AI Start] 客户端启动命令已发送 pid={} path={}",
+            child.id(),
+            launch_path.display()
+        ));
+        return Ok(child.id());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Err("WorkBuddy AI 启动仅支持 macOS、Windows 和 Linux".to_string())
+    }
+}

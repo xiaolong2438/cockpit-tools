@@ -52,3 +52,6 @@ docs/plugin-architecture-proposal.md
 .qoder/
 
 sidecars/mihomo/bin/
+
+# Mimosa scanner state
+.mimosa/

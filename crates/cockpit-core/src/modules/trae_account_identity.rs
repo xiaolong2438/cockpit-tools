@@ -1,4 +1,6 @@
-use crate::modules::account_query_identity::{IdentitySummary, QueryIdentity};
+use crate::modules::account_query_identity::{
+    BackfillCursor, BackfillStatus, IdentitySummary, QueryIdentity,
+};
 
 pub(crate) fn query_identity(account: &TraeAccount) -> QueryIdentity {
     QueryIdentity {
@@ -10,38 +12,27 @@ pub(crate) fn query_identity(account: &TraeAccount) -> QueryIdentity {
     }
 }
 
-fn schedule_identity_maintenance() {
+pub(crate) fn schedule_identity_maintenance() {
     if cfg!(test) {
         return;
     }
-    let Ok(path) = get_accounts_index_path() else {
+    let Ok(store) = index_store() else {
         return;
     };
-    crate::modules::background_maintenance::schedule(
-        format!("trae-identity:{}", path.display()),
+    let mut backfill = BackfillCursor::default();
+    crate::modules::schedule_identity_job(
+        format!("trae-identity:{}", store.legacy_path().display()),
         move || {
-            if get_accounts_index_path()? != path {
-                return Ok(true);
-            }
-            let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let mut index: TraeAccountIndex =
-                serde_json::from_str(&content).map_err(|e| e.to_string())?;
-            let (ready, changed) = crate::modules::account_query_identity::backfill(
-                &mut index.accounts,
-                |id| Ok(get_accounts_dir()?.join(format!("{id}.json"))),
+            let status = backfill.step(
+                &store,
+                &TRAE_ACCOUNT_INDEX_LOCK,
+                resolve_account_file_path,
                 |id| load_account(id).map(|a| a.summary()),
             )?;
-            if changed {
-                let Ok(_guard) = TRAE_ACCOUNT_INDEX_LOCK.try_lock() else {
-                    return Ok(false);
-                };
-                if !crate::modules::account_query_identity::commit_backfill(
-                    &path, &content, &index,
-                )? {
-                    return Ok(false);
-                }
-            }
-            Ok(ready)
+            Ok(matches!(
+                status,
+                BackfillStatus::Inactive | BackfillStatus::Done { .. }
+            ))
         },
     );
 }

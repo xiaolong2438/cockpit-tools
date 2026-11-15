@@ -1,5 +1,6 @@
 use crate::modules::account_query_identity::{
-    fingerprint, DedupScan, IdentitySummary, QueryIdentity, ScanResult,
+    fingerprint, BackfillCursor, BackfillStatus, DedupScan, IdentitySummary, QueryIdentity,
+    ScanResult,
 };
 
 pub(crate) fn query_identity(account: &KiroAccount) -> QueryIdentity {
@@ -25,59 +26,80 @@ fn identity_duplicates(left: &QueryIdentity, right: &QueryIdentity) -> bool {
         || (left.credential_digest.is_some() && left.credential_digest == right.credential_digest)
 }
 
-fn schedule_identity_maintenance() {
+pub(crate) fn schedule_identity_maintenance() {
     if cfg!(test) {
         return;
     } // Fixture tests drive migration steps explicitly.
-    let Ok(path) = get_accounts_index_path() else {
+    let Ok(store) = index_store() else {
         return;
     };
     let mut scan = DedupScan::default();
-    crate::modules::background_maintenance::schedule(
-        format!("kiro-identity:{}", path.display()),
+    let mut backfill = BackfillCursor::default();
+    let mut snapshot: Option<KiroAccountIndex> = None;
+    let mut pending = None;
+    crate::modules::schedule_identity_job(
+        format!("kiro-identity:{}", store.legacy_path().display()),
         move || {
-            if get_accounts_index_path()? != path {
-                return Ok(true);
-            }
-            // Do not invoke directory repair from a background maintenance batch.
-            let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let mut index: KiroAccountIndex =
-                serde_json::from_str(&content).map_err(|e| e.to_string())?;
-            if index.identity_maintenance_version == 1
-                && index.accounts.iter().all(|s| s.identity().is_some())
-            {
-                return Ok(true);
-            }
-            let (ready, changed) = crate::modules::account_query_identity::backfill(
-                &mut index.accounts,
+            let status = backfill.step(
+                &store,
+                &KIRO_ACCOUNT_INDEX_LOCK,
                 resolve_account_file_path,
                 |id| load_account(id).map(|a| a.summary()),
             )?;
-            if changed {
-                let Ok(_guard) = KIRO_ACCOUNT_INDEX_LOCK.try_lock() else {
-                    return Ok(false);
+            let (revision, version) = match status {
+                BackfillStatus::Inactive => return Ok(true),
+                BackfillStatus::Pending => return Ok(false),
+                BackfillStatus::Done { revision, version } => (revision, version),
+            };
+            if version == 1 {
+                return Ok(true);
+            }
+            if snapshot
+                .as_ref()
+                .and_then(|index| index.storage_revision.get())
+                != Some(revision)
+            {
+                snapshot = match store.load()? {
+                    crate::modules::antigravity_account_index_store::IndexRead::Active(index) => {
+                        Some(index)
+                    }
+                    _ => None,
                 };
-                crate::modules::account_query_identity::commit_backfill(&path, &content, &index)?;
+                scan = DedupScan::default();
+                pending = None;
+            }
+            let Some(index) = snapshot.as_mut() else {
+                return Ok(false);
+            };
+            if index.storage_revision.get() != Some(revision) {
                 return Ok(false);
             }
-            if !ready {
+            let outcome = pending.take().unwrap_or_else(|| {
+                scan.step(
+                    &index.accounts,
+                    index.identity_revision,
+                    identity_duplicates,
+                )
+            });
+            if matches!(outcome, ScanResult::Pending) {
                 return Ok(false);
             }
             let Ok(_guard) = KIRO_ACCOUNT_INDEX_LOCK.try_lock() else {
+                pending = Some(outcome);
                 return Ok(false);
             };
-            if fs::read_to_string(&path).map_err(|e| e.to_string())? != content {
+            let Some(_writer) = store.try_lock_writes()? else {
+                pending = Some(outcome);
+                return Ok(false);
+            };
+            if store.active_revision()? != Some(revision) {
                 return Ok(false);
             }
-            match scan.step(
-                &index.accounts,
-                index.identity_revision,
-                identity_duplicates,
-            ) {
+            match outcome {
                 ScanResult::Pending => Ok(false),
                 ScanResult::Complete => {
                     index.identity_maintenance_version = 1;
-                    save_account_index(&index)?;
+                    save_account_index(index)?;
                     Ok(true)
                 }
                 ScanResult::Pair(left, right) => {
@@ -117,11 +139,12 @@ fn schedule_identity_maintenance() {
                         crate::modules::account_query_identity::backup_duplicate(&removed_path)?;
                     // Save before removing anything. A failed index save leaves both
                     // original files recoverable and the next batch can retry.
-                    save_account_file(&merged)?;
-                    refresh_summary(&mut index, &merged);
+                    save_account_file_indexed(&merged, index)?;
+                    refresh_summary(index, &merged);
                     index.accounts.retain(|s| s.id != removed.id);
                     index.identity_revision = index.identity_revision.wrapping_add(1);
-                    save_account_index(&index)?;
+                    save_account_index(index)?;
+                    snapshot = None;
                     crate::modules::atomic_write::remove_file_if_hash_matches(
                         &removed_path,
                         removed_hash,
